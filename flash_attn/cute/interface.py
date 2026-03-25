@@ -545,6 +545,10 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
+    # SM120 does not support SplitKV in this kernel variant
+    if arch // 10 == 12 and num_splits > 1:
+        num_splits = 1
+
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
     if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
@@ -908,49 +912,24 @@ def _flash_attn_fwd(
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            # TMA kernel when: no paged KV, no varlen
-            is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
-            use_tma_sm120 = (page_table is None and not is_varlen)
-            if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
-                dtype, head_dim, head_dim_v, tile_m, tile_n,
-                num_mma_warps=4, kv_stages=2, is_causal=causal,
-            ):
-                fa_fwd = FlashAttentionForwardSm120Tma(
-                    dtype,
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    pack_gqa=pack_gqa,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    num_mma_warps=4,
-                    kv_stages=2,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                )
-            else:
-                fa_fwd = FlashAttentionForwardSm120(
-                    dtype,
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    is_split_kv=is_split_kv,
-                    pack_gqa=pack_gqa,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    num_stages=1,
-                    num_threads=num_threads,
-                    Q_in_regs=False,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                )
+            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"

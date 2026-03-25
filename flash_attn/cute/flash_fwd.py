@@ -33,6 +33,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparse_utils import sparse_tensor_m_block, run_block_sparse_mainloop_sm80
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.paged_kv import PagedKVManager
 from cutlass.cute import FastDivmodDivisor
@@ -978,6 +979,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            blocksparse_tensors,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -1019,6 +1021,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         num_splits: Int32,
         aux_tensors=None,
         fastdiv_mods=None,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1258,7 +1261,86 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             fastdiv_mods=fastdiv_mods,
         )
 
-        if n_block_max > n_block_min:
+        if const_expr(blocksparse_tensors is not None):
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Block-sparse mainloop (SM80/SM120)
+            # ///////////////////////////////////////////////////////////////////////////////
+            qkv_factor = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            subtile = self.q_subtile_factor if self.q_subtile_factor is not None else 1
+            bs_m = sparse_tensor_m_block(m_block, qkv_factor, subtile)
+            total_block_cnt = blocksparse_tensors[0][batch_size, num_head, bs_m] + (
+                blocksparse_tensors[2][batch_size, num_head, bs_m]
+                if const_expr(blocksparse_tensors[2] is not None)
+                else Int32(0)
+            )
+
+            bs_mask = AttentionMask(
+                self.tile_m, self.tile_n, seqlen, window_size_left, window_size_right, qkv_factor
+            )
+            bs_mask_fn = partial(
+                bs_mask.apply_mask,
+                batch_idx=batch_size,
+                head_idx=num_head,
+                m_block=m_block,
+                thr_mma=thr_mma_qk,
+                mask_causal=False,
+                mask_local=False,
+                aux_tensors=aux_tensors,
+            )
+
+            if total_block_cnt > 0:
+                gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
+                self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block,
+                            seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
+                cute.arch.cp_async_commit_group()
+                if const_expr(self.Q_in_regs):
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.barrier()
+                    tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+                    cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
+                    cute.arch.barrier()
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.barrier()
+
+                mma_one_n_block = partial(
+                    self.mma_one_n_block_bs,
+                    mma_params=mma_params,
+                    smem_copy_params=smem_copy_params,
+                    softmax=softmax,
+                    load_K=load_K,
+                    load_V=load_V,
+                    score_mod=self.score_mod,
+                    batch_idx=batch_size,
+                    head_idx=num_head,
+                    m_block=m_block,
+                    seqlen=seqlen,
+                    aux_tensors=aux_tensors,
+                    fastdiv_mods=fastdiv_mods,
+                )
+
+                run_block_sparse_mainloop_sm80(
+                    blocksparse_tensors,
+                    batch_size,
+                    num_head,
+                    m_block,
+                    mma_one_n_block,
+                    bs_mask_fn,
+                    self.mask_mod,
+                    fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+                    qkv_factor,
+                    subtile,
+                )
+
+            row_scale = softmax.finalize()
+            softmax.rescale_O(acc_O, row_scale)
+            sO = cute.make_tensor(sQ.iterator, sO_layout)
+            self.epilogue(
+                acc_O, softmax.row_sum, mO, mLSE, sO, seqlen, gmem_tiled_copy_O,
+                None, tiled_mma_pv, tidx, m_block, num_head, batch_size,
+            )
+
+        if const_expr(blocksparse_tensors is None):
             # ///////////////////////////////////////////////////////////////////////////////
             # Prologue
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1266,14 +1348,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
             self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
             cute.arch.cp_async_commit_group()
-    
+
             def preprocess_Q():
                 cute.arch.cp_async_wait_group(self.num_stages * 2 - 1)
                 if const_expr(self.Q_in_regs):
                     cute.arch.barrier()
                     tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
                     cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
-    
+
             # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
             # read from smem_q to registers, then load V.
             # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
@@ -1282,7 +1364,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 cute.arch.cp_async_commit_group()
                 preprocess_Q()
                 cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
-    
+
             for stage in cutlass.range_constexpr(self.num_stages):
                 if const_expr(not self.Q_in_regs or stage > 0):
                     if stage == 0 or n_block - stage >= 0:
@@ -1294,7 +1376,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     cute.arch.cp_async_commit_group()
             if const_expr(not self.Q_in_regs):
                 preprocess_Q()
-    
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1322,7 +1404,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
             )
-    
+
             # First iteration with seqlen masking
             smem_pipe_read = Int32(0)
             smem_pipe_write = Int32(self.num_stages - 1)
@@ -1353,8 +1435,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # The remaining iterations have no masking
-            # Use (n_block - n_block_min) so split-KV stops at n_block_min
-            for n_tile in cutlass.range(n_block - n_block_min, unroll=1):
+            for n_tile in cutlass.range(n_block, unroll=1):
                 compute_one_n_block(
                     n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
                     seqlen=seqlen, is_first_n_block=False,
@@ -1363,17 +1444,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # TODO: local
-    
+
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize()
             softmax.rescale_O(acc_O, row_scale)
-    
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
-            # reuse sQ's data iterator for sO (BF16 SMEM layout).
-            # For FP32 split-KV, the epilogue bypasses SMEM entirely (direct acc→GMEM),
-            # so sO is unused but still passed as a parameter.
+            # reuse sQ's data iterator
             sO = cute.make_tensor(sQ.iterator, sO_layout)
             self.epilogue(
                 acc_O,
@@ -1389,7 +1468,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 m_block,
                 num_head,
                 batch_size,
-                split_idx,
             )
 
     @cute.jit
@@ -1536,6 +1614,87 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             seqlen_info=seqlen,
             constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
+
+    @cute.jit
+    def mma_one_n_block_bs(
+        self,
+        n_block: Int32,
+        mma_params: SimpleNamespace,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        load_K: Callable,
+        load_V: Callable,
+        score_mod,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
+        seqlen: SeqlenInfoQK,
+        aux_tensors=None,
+        fastdiv_mods=None,
+        mask_fn: Optional[Callable] = None,
+        is_first_n_block: cutlass.Constexpr = False,
+    ):
+        """Process one KV block for block-sparse attention (load, GEMM QK, mask, softmax, PV GEMM).
+
+        Unlike compute_one_n_block, this does not overlap loads with the next block since the
+        next block address is not known ahead of time in the block-sparse case.
+        """
+        acc_S = cute.make_fragment(
+            mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+        )
+        acc_S.fill(0.0)
+
+        load_K(n_block, smem_pipe_write=0, need_predicates=True)
+        cute.arch.cp_async_commit_group()
+        load_V(n_block, smem_pipe_write=0, need_predicates=True)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(1)
+        cute.arch.barrier()
+
+        sm80_utils.gemm(
+            mma_params.thr_mma_qk,
+            acc_S,
+            mma_params.tSrQ,
+            mma_params.tSrK,
+            smem_copy_params.tSsQ,
+            smem_copy_params.tSsK[None, None, None, 0],
+            smem_copy_params.smem_thr_copy_Q,
+            smem_copy_params.smem_thr_copy_K,
+            A_in_regs=self.Q_in_regs,
+        )
+        if const_expr(score_mod is not None):
+            self.apply_score_mod(
+                mma_params.thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                acc_S,
+                n_block,
+                seqlen,
+                softmax_scale=softmax.softmax_scale,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
+            )
+
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S, n_block=n_block)
+
+        row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=True)
+        softmax.rescale_O(mma_params.acc_O, row_scale)
+        rP = cute.make_fragment_like(acc_S, self.dtype)
+        rP.store(acc_S.load().to(self.dtype))
+        tOrP = layout_utils.reshape_acc_to_frgA(rP)
+        sm80_utils.gemm_rs(
+            mma_params.thr_mma_pv,
+            mma_params.acc_O,
+            tOrP,
+            mma_params.tOrVt,
+            smem_copy_params.tOsVt[None, None, None, 0],
+            smem_copy_params.smem_thr_copy_V,
         )
 
 
