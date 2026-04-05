@@ -25,6 +25,7 @@ from quack import layout_utils
 
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.dropout import apply_dropout_mask
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
@@ -60,6 +61,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        p_dropout: float = 0.0,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -103,6 +105,11 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.p_dropout = p_dropout
+        self.is_dropout = p_dropout > 0.0
+        # Compile-time constants for dropout
+        self.p_keep_uint8 = int(255 * (1.0 - p_dropout)) if p_dropout > 0 else 255
+        self.rp_dropout = 1.0 / (1.0 - p_dropout) if 0 < p_dropout < 1.0 else 1.0
         self.qk_acc_dtype = Float32
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -876,6 +883,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -896,12 +905,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        # The SM80 base class never constructs tma_atom_O (it passes None to
-        # self.epilogue), so use_tma_O must stay False regardless of self.arch.
-        # FlashAttentionForwardSm120 inherits this class but self.arch is read
-        # from the DSL (= sm_120) in __init__, so without this the >= sm_90
-        # branch would crash in tma_get_copy_fn on consumer Blackwell.
-        self.use_tma_O = False
+        # SM90/SM100/SM110 use TMA for output store; SM80 and SM120 use CpAsync
+        self.use_tma_O = self.arch >= Arch.sm_90 and self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -989,7 +994,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_splits,
             aux_tensors,
             fastdiv_mods,
-            blocksparse_tensors,
+            Int32(cute.size(mQ.shape[2])) if const_expr(self.is_dropout) else None,  # dropout_nheads
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -1031,7 +1038,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         num_splits: Int32,
         aux_tensors=None,
         fastdiv_mods=None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1256,6 +1265,24 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tOsVt=tOsVt,
         )
 
+        # Dropout closure — applied after softmax, before P→V GEMM
+        dropout_fn = None
+        if const_expr(self.is_dropout):
+            dropout_fn = partial(
+                apply_dropout_mask,
+                thr_mma=thr_mma_qk,
+                batch_idx=batch_size,
+                head_idx=num_head,
+                nheads=dropout_nheads,
+                m_block=m_block,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+                p_keep_uint8=self.p_keep_uint8,
+                rp_dropout=Float32(self.rp_dropout),
+                seed_lo=cutlass.Uint32(dropout_seed_lo),
+                seed_hi=cutlass.Uint32(dropout_seed_hi),
+            )
+
         compute_one_n_block = partial(
             self.compute_one_n_block,
             mma_params=mma_params,
@@ -1269,6 +1296,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block=m_block,
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods,
+            dropout_fn=dropout_fn,
         )
 
         if const_expr(blocksparse_tensors is not None):
@@ -1496,6 +1524,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         aux_tensors=None,
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ):
@@ -1568,6 +1597,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+        # Apply dropout mask after softmax, before P→V GEMM
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=acc_S, n_block=n_block)
         softmax.rescale_O(mma_params.acc_O, row_scale)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
